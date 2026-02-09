@@ -1,6 +1,7 @@
 /**
  * Skill loader — registers built-in skills and provides a tool catalog for the LLM prompt.
  */
+import { config } from "../config/env.js";
 import { log } from "../utils/log.js";
 
 export interface ToolSchema {
@@ -275,6 +276,98 @@ function skillToGeminiDecl(skill: Skill): GeminiFunctionDeclaration {
       type: "OBJECT",
       properties,
       ...(skill.argsSchema.required?.length ? { required: skill.argsSchema.required } : {}),
+    },
+  };
+}
+
+// --- Ollama function declarations ---
+
+/** Ollama tool declaration — uses lowercase types (unlike Gemini's UPPERCASE) */
+interface OllamaFunctionDeclaration {
+  type: "function";
+  function: {
+    name: string;
+    description: string;
+    parameters: {
+      type: "object";
+      properties: Record<string, { type: string; description?: string }>;
+      required?: string[];
+    };
+  };
+}
+
+/** Tier 1 for Ollama: agent-focused essentials (smaller set than Gemini) */
+const OLLAMA_TIER1_PREFIXES = [
+  "help", "notes.", "files.read", "files.list", "files.write",
+  "shell.exec", "web.search", "web.fetch", "telegram.",
+  "system.status", "code.", "memory.", "analytics.",
+  "contacts.", "errors.", "ftp.", "git.", "time.",
+];
+
+/**
+ * Convert skills to Ollama function declarations.
+ * Agent-focused: smaller Tier 1 + keyword Tier 2, capped at ollamaMaxTools.
+ */
+export function getSkillsForOllama(
+  userMessage?: string,
+): OllamaFunctionDeclaration[] {
+  const skills = getAllSkills(); // agents are always admin
+
+  // Tier 1: agent essentials
+  const tier1: Skill[] = [];
+  const tier2Pool: Skill[] = [];
+
+  for (const s of skills) {
+    const isTier1 = s.name === "help" || OLLAMA_TIER1_PREFIXES.some((p) => s.name.startsWith(p));
+    if (isTier1) {
+      tier1.push(s);
+    } else {
+      tier2Pool.push(s);
+    }
+  }
+
+  // Tier 2: keyword matching (reuses TIER2_KEYWORDS from Gemini)
+  const lowerMessage = (userMessage || "").toLowerCase();
+  const matchedPrefixes = new Set<string>();
+
+  for (const { keywords, prefix } of TIER2_KEYWORDS) {
+    if (keywords.some((kw) => lowerMessage.includes(kw))) {
+      matchedPrefixes.add(prefix);
+    }
+  }
+
+  const tier2Matched = tier2Pool.filter((s) =>
+    Array.from(matchedPrefixes).some((p) => s.name.startsWith(p))
+  );
+
+  const selected = [...tier1, ...tier2Matched];
+  const cap = config.ollamaMaxTools || 40;
+  const capped = selected.slice(0, cap);
+  log.debug(`[loader] Ollama tools: ${capped.length} (tier1=${tier1.length}, tier2=${tier2Matched.length}, cap=${cap})`);
+
+  return capped.map(skillToOllamaDecl);
+}
+
+/** Convert a single Kingston skill to an Ollama function declaration */
+function skillToOllamaDecl(skill: Skill): OllamaFunctionDeclaration {
+  const properties: Record<string, { type: string; description?: string }> = {};
+  for (const [key, prop] of Object.entries(skill.argsSchema.properties)) {
+    properties[key] = {
+      type: prop.type, // lowercase: "string", "number", etc.
+      ...(prop.description ? { description: prop.description } : {}),
+    };
+  }
+
+  return {
+    type: "function",
+    function: {
+      name: skill.name,
+      description: skill.description,
+      parameters: {
+        type: "object",
+        properties,
+        ...(skill.argsSchema.required?.length ? { required: skill.argsSchema.required } : {}),
+      },
     },
   };
 }

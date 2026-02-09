@@ -2,10 +2,17 @@
  * Shared rate-limit state for Claude CLI.
  * Used by both the router (user messages) and agents.
  * When Claude is rate-limited, callers should fall back to Gemini/Ollama.
+ *
+ * Self-healing: instead of blocking for 2h blindly, the router probes
+ * Claude every PROBE_INTERVAL_MS to check if credits were added.
  */
 import { log } from "../utils/log.js";
 
 let rateLimitUntil = 0;
+let lastProbeAt = 0;
+
+/** Probe interval: try Claude every 5 minutes during rate limit */
+const PROBE_INTERVAL_MS = 5 * 60_000;
 
 /** Is Claude CLI currently rate-limited? */
 export function isClaudeRateLimited(): boolean {
@@ -23,11 +30,27 @@ export function rateLimitRemainingMinutes(): number {
   return Math.round((rateLimitUntil - Date.now()) / 60_000);
 }
 
+/**
+ * Should we probe Claude to check if the rate limit has lifted?
+ * Returns true every PROBE_INTERVAL_MS during an active rate limit,
+ * allowing the router to try Claude and auto-recover if credits were added.
+ */
+export function shouldProbeRateLimit(): boolean {
+  if (!isClaudeRateLimited()) return false;
+  return Date.now() - lastProbeAt >= PROBE_INTERVAL_MS;
+}
+
+/** Mark that we just tried a probe (prevents spamming Claude) */
+export function markProbeAttempt(): void {
+  lastProbeAt = Date.now();
+}
+
 /** Manually clear the rate limit (e.g. after a successful Claude call) */
 export function clearRateLimit(): void {
   if (rateLimitUntil > 0) {
     log.info("[rate-limit] Rate limit cleared — Claude CLI is available again");
     rateLimitUntil = 0;
+    lastProbeAt = 0;
   }
 }
 

@@ -41,14 +41,16 @@ export function selectModel(
     return "sonnet";
   }
 
-  // Agent tasks
+  // Agent tasks — Ollama-first when enabled (local, free, 24/7 with tools)
   if (message.startsWith("[AGENT:")) {
+    // Complex agent tasks still go to Sonnet for best quality
     if (/weekly.*deep.*dive|alpha.*report|proactive.*fix|effectiveness.*review/i.test(message)) return "sonnet";
-    // Agent heartbeats → ollama if enabled
-    if (config.ollamaEnabled && /heartbeat|status.*check|ping/i.test(message)) {
-      log.debug(`[model] Agent heartbeat → ollama`);
+    // All other agent tasks → Ollama with tool chain (when enabled)
+    if (config.ollamaEnabled) {
+      log.debug(`[model] Agent task → ollama (Ollama-first architecture)`);
       return "ollama";
     }
+    // Ollama disabled → fallback to haiku (backward compatible)
     return "haiku";
   }
 

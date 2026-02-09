@@ -106,6 +106,9 @@ function buildConfig() {
     ollamaEnabled: optional("OLLAMA_ENABLED", "false") === "true",
     ollamaModel: optional("OLLAMA_MODEL", "qwen2.5:14b"),
     ollamaUrl: optional("OLLAMA_URL", "http://localhost:11434"),
+    ollamaTimeoutMs: Number(optional("OLLAMA_TIMEOUT_MS", "120000")),
+    ollamaMaxTools: Number(optional("OLLAMA_MAX_TOOLS", "40")),
+    ollamaNumPredict: Number(optional("OLLAMA_NUM_PREDICT", "2048")),
 
     // Tool profiles (OpenClaw-like): "default" | "coding" | "automation" | "full"
     toolProfile: optional("TOOL_PROFILE", "full") as "default" | "coding" | "automation" | "full",
@@ -127,6 +130,8 @@ function buildConfig() {
     agentLearnerHeartbeatMs: Number(optional("AGENT_LEARNER_HEARTBEAT_MS", "7200000")),
     agentExecutorEnabled: optional("AGENT_EXECUTOR_ENABLED", "true") === "true",
     agentExecutorHeartbeatMs: Number(optional("AGENT_EXECUTOR_HEARTBEAT_MS", "300000")),
+    agentTradingMonitorEnabled: optional("AGENT_TRADING_MONITOR_ENABLED", "true") === "true",
+    agentTradingMonitorHeartbeatMs: Number(optional("AGENT_TRADING_MONITOR_HEARTBEAT_MS", "300000")),
   };
 }
 

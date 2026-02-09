@@ -76,7 +76,7 @@ const RETRY_DELAYS = [1000, 2000, 4000];
 
 // --- System instruction ---
 
-function buildSystemInstruction(isAdmin: boolean, chatId?: number): string {
+export function buildSystemInstruction(isAdmin: boolean, chatId?: number): string {
   const lines = [
     `You are Kingston, an autonomous AI assistant operating through a Telegram relay on the user's machine.`,
     `Your name is Kingston. You are proactive, capable, and concise.`,
@@ -233,7 +233,7 @@ async function callGeminiAPI(
 
 // --- Arg normalization ---
 
-function normalizeArgs(
+export function normalizeArgs(
   tool: string,
   args: Record<string, unknown>,
   chatId: number,
@@ -355,7 +355,7 @@ export async function runGemini(options: GeminiOptions): Promise<string> {
         }
 
         // Hard block: agents cannot use browser.*
-        if (chatId >= 100 && chatId <= 103 && toolName.startsWith("browser.")) {
+        if (chatId >= 100 && chatId <= 104 && toolName.startsWith("browser.")) {
           log.warn(`[gemini] Agent chatId=${chatId} tried to call ${toolName} — blocked`);
           contents.push({
             role: "user",

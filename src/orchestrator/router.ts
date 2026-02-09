@@ -9,14 +9,14 @@ import { getSkill, validateArgs, getSkillSchema } from "../skills/loader.js";
 import { runClaude } from "../llm/claudeCli.js";
 import { runClaudeStream, type StreamResult } from "../llm/claudeStream.js";
 import { runGemini, GeminiRateLimitError, GeminiSafetyError } from "../llm/gemini.js";
-import { runOllama, isOllamaAvailable } from "../llm/ollamaClient.js";
+import { runOllama, runOllamaChat, isOllamaAvailable } from "../llm/ollamaClient.js";
 import { addTurn, logError, getTurns, clearSession } from "../storage/store.js";
 import { autoCompact } from "./compaction.js";
 import { config } from "../config/env.js";
 import { log } from "../utils/log.js";
 import { extractAndStoreMemories } from "../memory/semantic.js";
 import { selectModel, getModelId, modelLabel, type ModelTier } from "../llm/modelSelector.js";
-import { isClaudeRateLimited, detectAndSetRateLimit, clearRateLimit, rateLimitRemainingMinutes } from "../llm/rateLimitState.js";
+import { isClaudeRateLimited, detectAndSetRateLimit, clearRateLimit, rateLimitRemainingMinutes, shouldProbeRateLimit, markProbeAttempt } from "../llm/rateLimitState.js";
 import type { DraftController } from "../bot/draftMessage.js";
 
 /**
@@ -90,21 +90,27 @@ async function fallbackWithoutClaude(
     }
   }
 
-  // --- Try Ollama (local, text-only, always available) ---
+  // --- Try Ollama with tools (local, full tool chain, always available) ---
   if (config.ollamaEnabled) {
     try {
       const ollamaUp = await isOllamaAvailable();
       if (ollamaUp) {
-        log.info(`[router] 🦙 Ollama fallback (Claude+Gemini down): ${userMessage.slice(0, 100)}...`);
-        await safeProgress(chatId, `🦙 Mode local (services cloud indisponibles ~${remainingMinutes}min)`);
-        const ollamaResult = await runOllama(chatId, userMessage);
-        addTurn(chatId, { role: "assistant", content: ollamaResult.text });
-        backgroundExtract(chatId, userMessage, ollamaResult.text);
-        log.info(`[router] Ollama fallback success (${ollamaResult.text.length} chars)`);
-        return ollamaResult.text;
+        log.info(`[router] 🦙 Ollama-chat fallback (Claude+Gemini down): ${userMessage.slice(0, 100)}...`);
+        await safeProgress(chatId, `🦙 Mode local avec outils (services cloud indisponibles ~${remainingMinutes}min)`);
+        const ollamaResult = await runOllamaChat({
+          chatId,
+          userMessage,
+          isAdmin: userIsAdmin,
+          userId,
+          onToolProgress: async (cid, msg) => safeProgress(cid, msg),
+        });
+        addTurn(chatId, { role: "assistant", content: ollamaResult });
+        backgroundExtract(chatId, userMessage, ollamaResult);
+        log.info(`[router] Ollama-chat fallback success (${ollamaResult.length} chars)`);
+        return ollamaResult;
       }
     } catch (err) {
-      log.warn(`[router] Ollama fallback failed: ${err instanceof Error ? err.message : String(err)}`);
+      log.warn(`[router] Ollama-chat fallback failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 
@@ -169,8 +175,42 @@ export async function handleMessage(
   const tier = selectModel(userMessage, contextHint);
   const model = getModelId(tier);
 
-  // --- Ollama path (trivial tasks — no tool chaining) ---
+  // --- Ollama path ---
   if (tier === "ollama") {
+    // Agents (chatId 100-104) get full tool chain via /api/chat
+    const isAgent = chatId >= 100 && chatId <= 104;
+
+    if (isAgent) {
+      try {
+        log.info(`[router] 🦙 Ollama-chat for agent ${chatId}: ${userMessage.slice(0, 100)}...`);
+        const result = await runOllamaChat({
+          chatId,
+          userMessage,
+          isAdmin: userIsAdmin,
+          userId,
+          onToolProgress: async (cid, msg) => safeProgress(cid, msg),
+        });
+        addTurn(chatId, { role: "assistant", content: result });
+        backgroundExtract(chatId, userMessage, result);
+        return result;
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        log.warn(`[router] Ollama-chat failed for agent ${chatId}, falling back to Haiku: ${errMsg}`);
+        const haikuModel = getModelId("haiku");
+        const haikuResult = await runClaude(chatId, userMessage, userIsAdmin, haikuModel);
+        if (haikuResult.type === "message") {
+          const text = haikuResult.text?.trim() || "Désolé, je n'ai pas pu répondre.";
+          addTurn(chatId, { role: "assistant", content: text });
+          backgroundExtract(chatId, userMessage, text);
+          return text;
+        }
+        const text = "Agent task acknowledged.";
+        addTurn(chatId, { role: "assistant", content: text });
+        return text;
+      }
+    }
+
+    // Non-agent: text-only (heartbeats, greetings)
     try {
       const ollamaResult = await runOllama(chatId, userMessage);
       addTurn(chatId, { role: "assistant", content: ollamaResult.text });
@@ -179,28 +219,32 @@ export async function handleMessage(
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       log.warn(`[router] Ollama failed, falling back to Haiku: ${errMsg}`);
-      // Fallback to Haiku
       const haikuModel = getModelId("haiku");
-      log.info(`[router] ${modelLabel("haiku")} Fallback from Ollama (admin=${userIsAdmin}): ${userMessage.slice(0, 100)}...`);
-      let haikuResult = await runClaude(chatId, userMessage, userIsAdmin, haikuModel);
+      const haikuResult = await runClaude(chatId, userMessage, userIsAdmin, haikuModel);
       if (haikuResult.type === "message") {
         const text = haikuResult.text?.trim() || "Désolé, je n'ai pas pu répondre.";
         addTurn(chatId, { role: "assistant", content: text });
         backgroundExtract(chatId, userMessage, text);
         return text;
       }
-      // If Haiku returns a tool_call on what should be trivial, just acknowledge
       const text = "Salut! Comment je peux t'aider?";
       addTurn(chatId, { role: "assistant", content: text });
       return text;
     }
   }
 
-  // --- Proactive bypass: if Claude is known rate-limited, skip directly to fallbacks ---
+  // --- Proactive bypass: if Claude is known rate-limited, skip to fallbacks ---
+  // But probe every 5min to auto-recover if credits were added
   if (isClaudeRateLimited()) {
-    const remaining = rateLimitRemainingMinutes();
-    log.info(`[router] Claude rate-limited (${remaining}min left) — bypassing to fallback chain`);
-    return await fallbackWithoutClaude(chatId, userMessage, userIsAdmin, userId, remaining);
+    if (shouldProbeRateLimit()) {
+      markProbeAttempt();
+      log.info(`[router] Probing Claude (rate limit may have lifted)...`);
+      // Fall through to try Claude normally — if it works, clearRateLimit() is called
+    } else {
+      const remaining = rateLimitRemainingMinutes();
+      log.info(`[router] Claude rate-limited (${remaining}min left) — bypassing to fallback chain`);
+      return await fallbackWithoutClaude(chatId, userMessage, userIsAdmin, userId, remaining);
+    }
   }
 
   // First pass: Claude
@@ -500,8 +544,42 @@ export async function handleMessageStreaming(
   const tier = selectModel(userMessage, "user");
   const model = getModelId(tier);
 
-  // --- Ollama path (trivial tasks — no tool chaining, no streaming needed) ---
+  // --- Ollama path ---
   if (tier === "ollama") {
+    // Agents get full tool chain (no streaming needed for agents)
+    const isAgentStream = chatId >= 100 && chatId <= 104;
+
+    if (isAgentStream) {
+      try {
+        log.info(`[router-stream] 🦙 Ollama-chat for agent ${chatId}: ${userMessage.slice(0, 100)}...`);
+        await draft.cancel();
+        const result = await runOllamaChat({
+          chatId,
+          userMessage,
+          isAdmin: userIsAdmin,
+          userId,
+          onToolProgress: async (cid, msg) => safeProgress(cid, msg),
+        });
+        addTurn(chatId, { role: "assistant", content: result });
+        backgroundExtract(chatId, userMessage, result);
+        return result;
+      } catch (err) {
+        log.warn(`[router-stream] Ollama-chat failed for agent ${chatId}: ${err instanceof Error ? err.message : String(err)}`);
+        await draft.cancel();
+        const haikuModel = getModelId("haiku");
+        const haikuResult = await runClaude(chatId, userMessage, userIsAdmin, haikuModel);
+        if (haikuResult.type === "message") {
+          const text = haikuResult.text?.trim() || "Désolé, je n'ai pas pu répondre.";
+          addTurn(chatId, { role: "assistant", content: text });
+          return text;
+        }
+        const text = "Agent task acknowledged.";
+        addTurn(chatId, { role: "assistant", content: text });
+        return text;
+      }
+    }
+
+    // Non-agent: text-only (no streaming needed for trivial responses)
     try {
       const ollamaResult = await runOllama(chatId, userMessage);
       await draft.update(ollamaResult.text);
@@ -527,12 +605,19 @@ export async function handleMessageStreaming(
   }
 
   // --- Proactive bypass: if Claude is known rate-limited, use Gemini/Ollama ---
+  // But probe every 5min to auto-recover if credits were added
   if (isClaudeRateLimited()) {
-    const remaining = rateLimitRemainingMinutes();
-    log.info(`[router-stream] Claude rate-limited (${remaining}min left) — bypassing to fallback`);
-    await draft.cancel();
-    const fallbackResult = await fallbackWithoutClaude(chatId, userMessage, userIsAdmin, userId, remaining);
-    return fallbackResult;
+    if (shouldProbeRateLimit()) {
+      markProbeAttempt();
+      log.info(`[router-stream] Probing Claude (rate limit may have lifted)...`);
+      // Fall through to try Claude normally
+    } else {
+      const remaining = rateLimitRemainingMinutes();
+      log.info(`[router-stream] Claude rate-limited (${remaining}min left) — bypassing to fallback`);
+      await draft.cancel();
+      const fallbackResult = await fallbackWithoutClaude(chatId, userMessage, userIsAdmin, userId, remaining);
+      return fallbackResult;
+    }
   }
 
   log.info(`[router] ${modelLabel(tier)} Streaming to Claude (admin=${userIsAdmin}): ${userMessage.slice(0, 100)}...`);
