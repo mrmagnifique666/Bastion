@@ -582,7 +582,88 @@ async function handleRequest(req: http.IncomingMessage, res: http.ServerResponse
       });
       return json(res, { ok: true, prompt });
     }
-    if (pathname.startsWith("/api/")) {
+    // ── TTS proxy (ElevenLabs) — keeps API key server-side ──
+    if (pathname === "/api/tts" && method === "POST") {
+      if (!checkAuth(req, res)) return;
+      const body = await parseBody(req);
+      const text = String(body.text || "").trim();
+      if (!text) return sendJson(res, 400, { ok: false, error: "text is required" });
+      if (!config.elevenlabsApiKey) return sendJson(res, 503, { ok: false, error: "ElevenLabs not configured" });
+      try {
+        const voiceId = config.elevenlabsVoiceId || "onwK4e9ZLuTAKqWW03F9";
+        const ttsResp = await fetch(`https://api.elevenlabs.io/v1/text-to-speech/${voiceId}`, {
+          method: "POST",
+          headers: {
+            "xi-api-key": config.elevenlabsApiKey,
+            "Content-Type": "application/json",
+          },
+          body: JSON.stringify({
+            text,
+            model_id: "eleven_multilingual_v2",
+            voice_settings: { stability: 0.5, similarity_boost: 0.75 },
+          }),
+        });
+        if (!ttsResp.ok) {
+          const errText = await ttsResp.text();
+          log.warn(`[tts] ElevenLabs error ${ttsResp.status}: ${errText.slice(0, 200)}`);
+          return sendJson(res, 502, { ok: false, error: `ElevenLabs: ${ttsResp.status}` });
+        }
+        const audioBuffer = Buffer.from(await ttsResp.arrayBuffer());
+        res.writeHead(200, {
+          "Content-Type": "audio/mpeg",
+          "Content-Length": audioBuffer.length,
+          "Access-Control-Allow-Origin": "*",
+        });
+        res.end(audioBuffer);
+      } catch (err) {
+        log.error(`[tts] Error: ${err instanceof Error ? err.message : String(err)}`);
+        return sendJson(res, 500, { ok: false, error: "TTS failed" });
+      }
+      return;
+    }
+
+    // ── VisionClaw / OpenAI-compatible endpoint ──
+    // Drop-in replacement for OpenClaw gateway — used by smart glasses, external apps, etc.
+    // Format: POST /v1/chat/completions with OpenAI request body
+    if (pathname === "/v1/chat/completions" && method === "POST") {
+      if (!checkAuth(req, res)) return;
+      const body = await parseBody(req);
+      const messages = body.messages as Array<{ role: string; content: string }> | undefined;
+      if (!messages || !messages.length) {
+        return sendJson(res, 400, { error: { message: "messages array is required", type: "invalid_request_error" } });
+      }
+      // Extract the last user message (standard OpenAI pattern)
+      const lastUserMsg = [...messages].reverse().find(m => m.role === "user");
+      const userMessage = lastUserMsg?.content?.trim();
+      if (!userMessage) {
+        return sendJson(res, 400, { error: { message: "No user message found", type: "invalid_request_error" } });
+      }
+      // Use dedicated chatId=4 for VisionClaw (separate conversation memory)
+      const VISIONCLAW_CHAT_ID = 4;
+      const userId = getDashboardUserId();
+      log.info(`[visionclaw] POST /v1/chat/completions: ${userMessage.slice(0, 100)}...`);
+      try {
+        const response = await handleMessage(VISIONCLAW_CHAT_ID, userMessage, userId, "user");
+        return sendJson(res, 200, {
+          id: `chatcmpl-${Date.now()}`,
+          object: "chat.completion",
+          created: Math.floor(Date.now() / 1000),
+          model: body.model || "bastion",
+          choices: [{
+            index: 0,
+            message: { role: "assistant", content: response },
+            finish_reason: "stop",
+          }],
+          usage: { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+        });
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        log.error(`[visionclaw] Error: ${errMsg}`);
+        return sendJson(res, 500, { error: { message: errMsg, type: "server_error" } });
+      }
+    }
+
+    if (pathname.startsWith("/api/") || pathname.startsWith("/v1/")) {
       return sendJson(res, 404, { ok: false, error: "Not found" });
     }
 
