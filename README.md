@@ -1,38 +1,105 @@
-# claude-telegram-relay
+# Bastion
 
-Self-hosted Telegram relay that connects Telegram chats to a local **Claude Code CLI** and returns responses — no cloud API keys needed, just the CLI on your PATH.
+**Your personal AI fortress.** Kingston runs here.
 
-> **Inspired by** [godagoo/claude-telegram-relay](https://github.com/godagoo/claude-telegram-relay). This repository is an original, from-scratch implementation.
+Bastion is a self-hosted autonomous AI platform that connects a Telegram bot to a local Claude Code CLI, with 300+ skills, semantic memory, a multi-agent system, and a web dashboard. Zero cloud API costs — runs entirely on your machine.
+
+> Originally inspired by [godagoo/claude-telegram-relay](https://github.com/godagoo/claude-telegram-relay). This is a complete, from-scratch reimplementation that has evolved far beyond a simple relay.
+
+---
+
+## Architecture
+
+```
+Telegram ←→ grammY (long polling)
+               ↓
+         Orchestrator (router.ts)
+          ┌────┼────────┐
+          ↓    ↓        ↓
+      Claude  Gemini  Ollama
+      CLI     Flash   (local)
+      (brain) (tools) (trivial)
+          ↓
+    300+ Skills ←→ SQLite + Semantic Memory
+          ↓
+    4 Autonomous Agents (Scout, Analyst, Learner, Executor)
+          ↓
+    Dashboard (localhost:3200) + Voice Server (Twilio/Deepgram/ElevenLabs)
+```
+
+### Model Tiers
+
+| Tier | Model | Usage | Cost |
+|------|-------|-------|------|
+| Opus | Claude CLI (Max plan) | User conversations | $0 |
+| Sonnet | Claude CLI | Follow-up tool chains | $0 |
+| Haiku | Claude CLI | Agent cycles | $0 |
+| Ollama | qwen2.5:14b (local) | Heartbeats, greetings | $0 |
+| Gemini | 2.0 Flash | Vision, image gen, browser | $0 |
+
+---
 
 ## Features
 
+### Core
 - **Telegram ↔ Claude Code CLI** — messages flow through your local `claude` binary
-- **Conversation memory** — per-chat history stored in SQLite (configurable turn limit)
+- **300+ skills** across 73 namespaces (files, git, web, browser, office, social, business, etc.)
+- **Semantic memory** — MemU-inspired system with Gemini embeddings, auto-extraction, cosine similarity search
+- **Conversation memory** — per-chat history in SQLite with configurable turn limit
+- **Progressive disclosure** — compact skill catalog (~5KB) instead of full schema (~50KB)
+- **SOUL.md** — editable AI personality file that Kingston can modify
+
+### Agents
+- **Scout** — Market intelligence & prospecting (4h cycles, 6-cycle rotation)
+- **Analyst** — Performance analysis & tiered reports (6h cycles)
+- **Learner** — Error analysis & self-improvement (8h cycles, 3-cycle rotation)
+- **Executor** — Code request bridge between Kingston and Emile (5min polling)
+
+### Security
 - **User allowlist** — only approved Telegram user IDs can interact
-- **Rate limiting** — per-user token bucket (burst of 3, configurable cooldown)
-- **Sandboxed tools** — built-in skill system with `help`, `notes.*`, `files.*`
-- **Tool allowlist** — only permitted tools can be invoked; no arbitrary shell
-- **Secret redaction** — bot token and sensitive values are stripped from logs
-- **Windows-first** — tested on PowerShell; works on Linux/macOS too
+- **Tool profiles** — 4 tiers (default/coding/automation/full) with granular permissions
+- **SSRF protection** — DNS resolution + private IP blocking on outbound requests
+- **Strict tool_call parsing** — pure JSON only, no embedded JSON injection
+- **Path traversal prevention** — pre-resolve `..` + null byte rejection
+- **Dashboard auth** — token-based, localhost-only, CORS restricted
+- **Log redaction** — 8 secret patterns automatically stripped from output
+
+### Integrations
+- **Voice** — Twilio SIP → Deepgram STT → Claude → ElevenLabs TTS (mulaw 8kHz)
+- **Browser** — 14 Puppeteer-based skills including AI computer-use
+- **Email** — Gmail OAuth (send, read, search, reply, draft, labels)
+- **Calendar** — Google Calendar OAuth (create, search, delete events)
+- **SMS** — Twilio (send, receive, reply, bulk)
+- **Social** — Twitter, LinkedIn, Reddit, Discord, Facebook, Instagram, Moltbook
+- **Business** — Stripe, HubSpot, booking, contacts
+- **FTP** — File deployment to web hosting
+- **Office** — Word, Excel, PowerPoint, CSV via Python
+- **OS** — Process management, clipboard, screenshots, app control, registry, services
+
+### Dashboard
+- **11 views**: chat, overview, sessions, scheduler, agents, skills, memory, config, logs, debug, system
+- **Live logs** via WebSocket broadcast
+- **Skills browser** with namespace grouping and search
+- **Config editor** with secrets masking
+- **Conseil mode** — Kingston + Emile collaborative interface
+
+---
 
 ## Prerequisites
 
-- **Bun** ≥ 1.1 (preferred) or **Node.js** ≥ 20
-- **Claude Code CLI** installed and on your PATH (`claude --version` should work)
+- **Node.js** >= 20 (runs via tsx, no build step)
+- **Claude Code CLI** installed and on your PATH (`claude --version`)
 - A **Telegram Bot Token** from [@BotFather](https://t.me/BotFather)
+- **Ollama** (optional) for local model tier
+- **Python 3** (optional) for office/image/PDF skills
 
 ## Quickstart
 
 ### 1. Clone & install
 
 ```bash
-git clone https://github.com/YOUR_USER/claude-telegram-relay.git
-cd claude-telegram-relay
-
-# Bun (preferred)
-bun install
-
-# Node.js alternative
+git clone https://github.com/mrmagnifique666/Bastion.git
+cd Bastion
 npm install
 ```
 
@@ -42,155 +109,166 @@ npm install
 cp .env.example .env
 ```
 
-Edit `.env`:
+Key environment variables:
 
 | Variable | Description |
-|---|---|
+|----------|-------------|
 | `TELEGRAM_BOT_TOKEN` | Token from BotFather |
-| `TELEGRAM_ALLOWED_USERS` | Comma-separated Telegram user IDs (get yours from [@userinfobot](https://t.me/userinfobot)) |
-| `SANDBOX_DIR` | Directory for sandboxed file tools (default `./sandbox`) |
-| `CLAUDE_BIN` | Path to Claude CLI binary (default `claude`) |
-| `CLAUDE_ALLOWED_TOOLS` | Allowed tool patterns (default `help,notes.*,files.*`) |
-| `MEMORY_TURNS` | Max conversation turns to keep per chat (default `12`) |
-| `RATE_LIMIT_MS` | Minimum ms between messages per user (default `2000`) |
+| `TELEGRAM_ALLOWED_USERS` | Comma-separated Telegram user IDs |
+| `CLAUDE_BIN` | Path to Claude CLI binary (default: `claude`) |
+| `SANDBOX_DIR` | Directory for sandboxed file tools (default: `./sandbox`) |
+| `MEMORY_TURNS` | Max conversation turns per chat (default: `30`) |
+| `OLLAMA_ENABLED` | Enable local Ollama tier (default: `false`) |
+| `OLLAMA_MODEL` | Ollama model name (default: `qwen2.5:14b`) |
+| `DASHBOARD_TOKEN` | Auth token for dashboard (optional) |
+| `ADMIN_PASSPHRASE` | Passphrase for admin mode in Telegram |
+| `ELEVENLABS_API_KEY` | For voice TTS (optional) |
+| `DEEPGRAM_API_KEY` | For voice STT (optional) |
+| `TWILIO_ACCOUNT_SID` | For voice/SMS (optional) |
+| `GEMINI_API_KEY` | For vision, image gen, browser computer-use |
 
 ### 3. Run
 
 ```bash
-# Bun
-bun run dev      # watch mode
-bun run start    # production
-
-# Node.js
-npm run dev:node
-npm run start:node
+npm run dev:node     # development (watch mode)
+npm run start:node   # production
 ```
 
 ### 4. Test
 
 ```bash
-# Bun
-bun test
-
-# Node.js
-npm run test:node
+npm test
 ```
 
-## How It Works
-
-```
-Telegram message
-  → grammY bot (long polling)
-    → allowlist + rate limit check
-      → orchestrator builds prompt (system policy + tool catalog + history + message)
-        → claude -p - --output-format json (prompt via stdin)
-          → parse JSON response
-            → if tool_call: validate → execute skill → optional 2nd pass
-            → if message: send back to Telegram
-```
-
-## Bot Commands
-
-| Command | Description |
-|---|---|
-| `/start` | Welcome message |
-| `/clear` | Reset conversation history |
-| `/help` | List available tools |
-| `/admin <passphrase>` | Enable admin mode (if configured) |
-
-## Built-in Skills
-
-| Tool | Description |
-|---|---|
-| `help` | Lists all available tools |
-| `notes.add` | Save a note |
-| `notes.list` | List all saved notes |
-| `notes.search` | Search notes by keyword |
-| `files.list` | List files in the sandbox |
-| `files.read` | Read a file from the sandbox (max 10 KB) |
-
-## Security
-
-- **No arbitrary shell execution** — tools are validated against an allowlist
-- **User allowlist** — unapproved Telegram user IDs are rejected
-- **Sandboxed files** — `files.*` tools are restricted to `SANDBOX_DIR` with path-escape prevention
-- **Rate limiting** — prevents abuse via token-bucket rate limiter
-- **No plaintext secrets** — all configuration via `.env`
-- **Log redaction** — bot token is automatically stripped from log output
-
-## Troubleshooting
-
-### "claude not found"
-
-The Claude Code CLI must be on your PATH.
-
-```bash
-# Verify it works
-claude --version
-
-# If installed but not on PATH, set the full path in .env:
-CLAUDE_BIN=C:\Users\YourName\.claude\claude.exe   # Windows
-CLAUDE_BIN=/usr/local/bin/claude                    # Linux/macOS
-```
-
-### PATH issues on Windows
-
-PowerShell may not inherit PATH changes from a new installation. Try:
-
-1. Close and reopen your terminal
-2. Run `refreshenv` (if using Chocolatey)
-3. Set the full path in `CLAUDE_BIN` as shown above
-
-### Telegram polling conflicts
-
-If you see "409 Conflict" errors, another instance of the bot is running with the same token. Stop the other instance before starting a new one.
-
-### SQLite errors on Node.js
-
-`better-sqlite3` requires native compilation. If `npm install` fails:
-
-```bash
-# Windows: install build tools
-npm install -g windows-build-tools
-
-# Linux: install build essentials
-sudo apt-get install build-essential python3
-
-# macOS: install Xcode command line tools
-xcode-select --install
-```
-
-With Bun, the native SQLite bindings are built-in and this is not an issue.
+---
 
 ## Project Structure
 
 ```
-.
-├── README.md
-├── package.json
-├── bunfig.toml
-├── tsconfig.json
-├── .env.example
+bastion/
 ├── src/
-│   ├── index.ts              # Entry point
-│   ├── config/env.ts         # Environment config loader
-│   ├── bot/telegram.ts       # grammY bot setup
-│   ├── orchestrator/router.ts # Tool router & message handler
-│   ├── llm/claudeCli.ts      # Claude CLI spawn & prompt builder
-│   ├── llm/protocol.ts       # JSON protocol parser
-│   ├── security/policy.ts    # User & tool allowlists
-│   ├── security/rateLimit.ts # Token-bucket rate limiter
-│   ├── storage/store.ts      # SQLite conversation store
-│   ├── skills/loader.ts      # Skill registry & catalog
-│   ├── skills/builtin/help.ts
-│   ├── skills/builtin/notes.ts
-│   ├── skills/builtin/files.ts
-│   └── utils/log.ts          # Levelled logger with redaction
+│   ├── index.ts                 # Entry point — bot, scheduler, agents, dashboard, voice
+│   ├── wrapper.ts               # Process wrapper for auto-restart
+│   ├── agents/                  # Autonomous agent system
+│   │   ├── base.ts              # Base agent class (lifecycle, rate limits)
+│   │   ├── manager.ts           # Agent bootstrap & management
+│   │   └── definitions/         # Scout, Analyst, Learner, Executor configs
+│   ├── bot/
+│   │   └── telegram.ts          # grammY bot setup & message handling
+│   ├── browser/                 # Puppeteer browser manager
+│   ├── config/
+│   │   └── env.ts               # Environment config with hot-reload
+│   ├── dashboard/               # Web dashboard (HTML + REST API + WebSocket)
+│   ├── gmail/                   # Google OAuth client
+│   ├── hooks/                   # Event hook system (startup, session, agent cycles)
+│   ├── llm/
+│   │   ├── claudeCli.ts         # Claude CLI spawn & prompt builder (single-shot)
+│   │   ├── claudeStream.ts      # Claude CLI streaming mode
+│   │   ├── gemini.ts            # Gemini Flash client (tools only)
+│   │   ├── ollamaClient.ts      # Local Ollama client
+│   │   └── protocol.ts          # Strict JSON tool_call parser
+│   ├── memory/
+│   │   └── semantic.ts          # MemU semantic memory (embeddings + CRUD)
+│   ├── orchestrator/
+│   │   └── router.ts            # Message routing, tool chaining, model selection
+│   ├── processors/              # Message pre/post processors
+│   ├── scheduler/               # Cron-like task scheduler
+│   ├── security/
+│   │   ├── policy.ts            # Tool profiles & allowlists
+│   │   ├── rateLimit.ts         # Token-bucket rate limiter
+│   │   └── ssrf.ts              # SSRF protection module
+│   ├── skills/
+│   │   ├── loader.ts            # Skill registry, compact catalog, progressive disclosure
+│   │   └── builtin/             # 70 skill files, 300+ individual skills
+│   ├── storage/
+│   │   └── store.ts             # SQLite (turns, notes, memory_items, agents, sessions)
+│   ├── utils/
+│   │   ├── log.ts               # Levelled logger with secret redaction
+│   │   └── paths.ts             # Path traversal protection
+│   └── voice/                   # Twilio → Deepgram → Claude → ElevenLabs pipeline
+├── relay/
+│   ├── SOUL.md                  # Kingston's editable personality
+│   ├── AUTONOMOUS.md            # Autonomous mode instructions
+│   └── schedules.json           # Scheduled tasks config
 ├── tests/
-│   ├── setup.ts
-│   └── protocol.test.ts
-└── sandbox/                   # Created at runtime
+├── .env.example
+├── package.json
+└── tsconfig.json
 ```
+
+## Skill Namespaces (300+)
+
+| Namespace | Skills | Description |
+|-----------|--------|-------------|
+| `files.*` | 16 | File CRUD, search, zip, diff, bulk rename, checksums |
+| `browser.*` | 14 | Navigate, click, type, extract, screenshots, AI computer-use |
+| `system.*` | 15 | Services, env, disk, installed apps, startup, full system info |
+| `twitter.*` | 9 | Tweet, reply, search, follow, DM, timeline, analytics |
+| `moltbook.*` | 11 | Posts, comments, follow, search, feed, profile |
+| `reddit.*` | 8 | Post, comment, search, subscribe, upvote, trending |
+| `linkedin.*` | 7 | Post, connect, search, message, profile, jobs |
+| `stripe.*` | 7 | Customers, charges, invoices, subscriptions, products |
+| `hubspot.*` | 7 | Contacts, deals, companies, tasks, notes, pipeline |
+| `gmail.*` | 6 | Send, read, search, reply, draft, labels |
+| `git.*` | 6 | Status, diff, commit, push, branch, log |
+| `browser.*` | 14 | Full browser automation with Puppeteer |
+| `calendar.*` | 5 | Google Calendar — create, search, delete events |
+| `ftp.*` | 7 | Connect, list, upload, download, delete, mkdir |
+| `sms.*` | 4 | Send, receive, reply, bulk SMS via Twilio |
+| `memory.*` | 7 | Semantic search, remember, forget, stats, update, query |
+| `agents.*` | 4 | List, status, pause, resume agents |
+| `ollama.*` | 4 | Models, chat, pull, delete local models |
+| `office.*` | 5 | Word, Excel, PowerPoint, CSV, list documents |
+| `pdf.*` | 5 | Info, extract text, merge, split, to images |
+| `image.*` | 7 | Info, resize, crop, watermark, convert, generate |
+| ... | ... | 73 namespaces total |
+
+---
+
+## Bot Commands
+
+| Command | Description |
+|---------|-------------|
+| `/start` | Welcome message |
+| `/clear` | Reset conversation history |
+| `/help` | List available skills |
+| `/admin <passphrase>` | Enable admin mode |
+
+---
+
+## Cost Architecture
+
+Bastion is designed to run at **$0/month**:
+
+- **Claude CLI** on Anthropic's Max plan — no API key charges
+- **Gemini 2.0 Flash** free tier — vision, image generation, browser tools
+- **Ollama** local inference — heartbeats and trivial queries
+- **Voice** (optional) — Deepgram/ElevenLabs/Twilio have free tiers
+
+---
+
+## Troubleshooting
+
+### "claude not found"
+Ensure the Claude Code CLI is on your PATH: `claude --version`. Or set the full path in `.env`:
+```
+CLAUDE_BIN=C:\Users\YourName\.claude\claude.exe
+```
+
+### EADDRINUSE
+Another instance is running. Kill node processes and remove the lock file:
+```bash
+taskkill /F /IM node.exe    # Windows
+rm relay/bot.lock
+```
+
+### SQLite compilation errors
+```bash
+npm install -g windows-build-tools   # Windows
+sudo apt-get install build-essential  # Linux
+```
+
+---
 
 ## License
 
