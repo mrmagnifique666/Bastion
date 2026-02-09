@@ -9,13 +9,14 @@ import { getSkill, validateArgs, getSkillSchema } from "../skills/loader.js";
 import { runClaude } from "../llm/claudeCli.js";
 import { runClaudeStream, type StreamResult } from "../llm/claudeStream.js";
 import { runGemini, GeminiRateLimitError, GeminiSafetyError } from "../llm/gemini.js";
-import { runOllama } from "../llm/ollamaClient.js";
+import { runOllama, isOllamaAvailable } from "../llm/ollamaClient.js";
 import { addTurn, logError, getTurns, clearSession } from "../storage/store.js";
 import { autoCompact } from "./compaction.js";
 import { config } from "../config/env.js";
 import { log } from "../utils/log.js";
 import { extractAndStoreMemories } from "../memory/semantic.js";
 import { selectModel, getModelId, modelLabel, type ModelTier } from "../llm/modelSelector.js";
+import { isClaudeRateLimited, detectAndSetRateLimit, clearRateLimit, rateLimitRemainingMinutes } from "../llm/rateLimitState.js";
 import type { DraftController } from "../bot/draftMessage.js";
 
 /**
@@ -50,16 +51,76 @@ async function safeProgress(chatId: number, message: string): Promise<void> {
 function shouldUseGemini(chatId: number): boolean {
   // Must be enabled and have API key
   if (!config.geminiOrchestratorEnabled || !config.geminiApiKey) return false;
-  // Agents (chatId 100-103) always use Claude CLI to preserve Gemini rate limit for user
-  if (chatId >= 100 && chatId <= 103) return false;
+  // Agents (chatId 100-104) always use Claude CLI to preserve Gemini rate limit for user
+  if (chatId >= 100 && chatId <= 104) return false;
   return true;
+}
+
+/**
+ * Fallback chain when Claude CLI is unavailable (rate-limited or down).
+ * Tries: Gemini Flash (full tool chain) → Ollama (text-only) → error message.
+ * Ensures the bot NEVER goes silent.
+ */
+async function fallbackWithoutClaude(
+  chatId: number,
+  userMessage: string,
+  userIsAdmin: boolean,
+  userId: number,
+  remainingMinutes: number
+): Promise<string> {
+  // --- Try Gemini Flash (supports full tool chain, $0) ---
+  if (config.geminiApiKey) {
+    try {
+      log.info(`[router] 🔄 Gemini fallback (Claude down ${remainingMinutes}min): ${userMessage.slice(0, 100)}...`);
+      await safeProgress(chatId, `⚡ Mode Gemini (Claude indisponible ~${remainingMinutes}min)`);
+      const geminiResult = await runGemini({
+        chatId,
+        userMessage,
+        isAdmin: userIsAdmin,
+        userId,
+        onToolProgress: async (cid, msg) => safeProgress(cid, msg),
+      });
+      addTurn(chatId, { role: "assistant", content: geminiResult });
+      backgroundExtract(chatId, userMessage, geminiResult);
+      log.info(`[router] Gemini fallback success (${geminiResult.length} chars)`);
+      return geminiResult;
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      log.warn(`[router] Gemini fallback also failed: ${errMsg}`);
+    }
+  }
+
+  // --- Try Ollama (local, text-only, always available) ---
+  if (config.ollamaEnabled) {
+    try {
+      const ollamaUp = await isOllamaAvailable();
+      if (ollamaUp) {
+        log.info(`[router] 🦙 Ollama fallback (Claude+Gemini down): ${userMessage.slice(0, 100)}...`);
+        await safeProgress(chatId, `🦙 Mode local (services cloud indisponibles ~${remainingMinutes}min)`);
+        const ollamaResult = await runOllama(chatId, userMessage);
+        addTurn(chatId, { role: "assistant", content: ollamaResult.text });
+        backgroundExtract(chatId, userMessage, ollamaResult.text);
+        log.info(`[router] Ollama fallback success (${ollamaResult.text.length} chars)`);
+        return ollamaResult.text;
+      }
+    } catch (err) {
+      log.warn(`[router] Ollama fallback failed: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // --- All models down — return a useful error instead of silence ---
+  const msg = `⚠️ Tous les modèles sont temporairement indisponibles. Claude se réinitialise dans ~${remainingMinutes} minutes. Réessaie bientôt.`;
+  log.error(`[router] ALL models unavailable — Claude (rate-limited), Gemini (${config.geminiApiKey ? "failed" : "no key"}), Ollama (${config.ollamaEnabled ? "failed" : "disabled"})`);
+  addTurn(chatId, { role: "assistant", content: msg });
+  return msg;
 }
 
 /**
  * Handle a user message end-to-end:
  * 1. Try Gemini (if enabled) — handles tool chain internally
  * 2. On Gemini failure, fall back to Claude CLI with manual tool chain
- * 3. Store turns and return the final text
+ * 3. On Claude rate limit, fall back to Gemini → Ollama → error
+ * 4. Store turns and return the final text
  */
 export async function handleMessage(
   chatId: number,
@@ -135,12 +196,26 @@ export async function handleMessage(
     }
   }
 
+  // --- Proactive bypass: if Claude is known rate-limited, skip directly to fallbacks ---
+  if (isClaudeRateLimited()) {
+    const remaining = rateLimitRemainingMinutes();
+    log.info(`[router] Claude rate-limited (${remaining}min left) — bypassing to fallback chain`);
+    return await fallbackWithoutClaude(chatId, userMessage, userIsAdmin, userId, remaining);
+  }
+
   // First pass: Claude
   log.info(`[router] ${modelLabel(tier)} Sending to Claude (admin=${userIsAdmin}): ${userMessage.slice(0, 100)}...`);
   let result = await runClaude(chatId, userMessage, userIsAdmin, model);
   log.info(`[router] Claude responded with type: ${result.type}`);
 
   if (result.type === "message") {
+    // --- Rate limit detection: catch it before passing to user ---
+    if (result.text && detectAndSetRateLimit(result.text)) {
+      log.warn(`[router] Claude rate-limited — falling back for this message`);
+      const remaining = rateLimitRemainingMinutes();
+      return await fallbackWithoutClaude(chatId, userMessage, userIsAdmin, userId, remaining);
+    }
+
     const isEmpty = !result.text || !result.text.trim() || result.text.includes("(Claude returned an empty response)");
     if (isEmpty) {
       // Auto-recovery: clear corrupt session and retry with fresh context
@@ -148,6 +223,13 @@ export async function handleMessage(
       clearSession(chatId);
       result = await runClaude(chatId, userMessage, userIsAdmin, model);
       log.info(`[router] Retry responded with type: ${result.type}`);
+
+      // Check retry for rate limit too
+      if (result.type === "message" && result.text && detectAndSetRateLimit(result.text)) {
+        log.warn(`[router] Claude rate-limited on retry — falling back`);
+        return await fallbackWithoutClaude(chatId, userMessage, userIsAdmin, userId, rateLimitRemainingMinutes());
+      }
+
       if (result.type === "message") {
         const text = result.text && result.text.trim()
           ? result.text
@@ -158,10 +240,15 @@ export async function handleMessage(
       }
       // Retry returned a tool_call — continue to tool chain below
     } else {
+      // Successful Claude response — clear any stale rate limit
+      clearRateLimit();
       addTurn(chatId, { role: "assistant", content: result.text });
       backgroundExtract(chatId, userMessage, result.text);
       return result.text;
     }
+  } else {
+    // Tool call succeeded — Claude is working, clear rate limit
+    clearRateLimit();
   }
 
   // Tool chaining loop — use sonnet for follow-ups (keeps intelligence + personality)
@@ -205,13 +292,13 @@ export async function handleMessage(
 
     // Agent chatId fix: agents use fake chatIds (100-103) for session isolation.
     // When they call telegram.send/voice, replace with the real admin chatId.
-    if (chatId >= 100 && chatId <= 103 && tool.startsWith("telegram.") && config.adminChatId > 0) {
+    if (chatId >= 100 && chatId <= 104 && tool.startsWith("telegram.") && config.adminChatId > 0) {
       safeArgs.chatId = String(config.adminChatId);
       log.debug(`[router] Agent ${chatId}: rewrote chatId to admin ${config.adminChatId} for ${tool}`);
     }
 
     // Hard block: agents (chatId 100-103) cannot use browser.* tools — they open visible windows
-    if (chatId >= 100 && chatId <= 103 && tool.startsWith("browser.")) {
+    if (chatId >= 100 && chatId <= 104 && tool.startsWith("browser.")) {
       const msg = `Tool "${tool}" is blocked for agents — use web.search instead.`;
       log.warn(`[router] Agent chatId=${chatId} tried to call ${tool} — blocked`);
       const followUp = `[Tool "${tool}" error]:\n${msg}`;
@@ -439,6 +526,15 @@ export async function handleMessageStreaming(
     }
   }
 
+  // --- Proactive bypass: if Claude is known rate-limited, use Gemini/Ollama ---
+  if (isClaudeRateLimited()) {
+    const remaining = rateLimitRemainingMinutes();
+    log.info(`[router-stream] Claude rate-limited (${remaining}min left) — bypassing to fallback`);
+    await draft.cancel();
+    const fallbackResult = await fallbackWithoutClaude(chatId, userMessage, userIsAdmin, userId, remaining);
+    return fallbackResult;
+  }
+
   log.info(`[router] ${modelLabel(tier)} Streaming to Claude (admin=${userIsAdmin}): ${userMessage.slice(0, 100)}...`);
 
   // First pass: try streaming (with safety timeout to prevent hanging)
@@ -475,6 +571,14 @@ export async function handleMessageStreaming(
 
   // If it's a plain text response, we're done (draft already has the content)
   if (!streamResult.is_tool_call) {
+    // --- Rate limit detection in streaming response ---
+    if (streamResult.text && detectAndSetRateLimit(streamResult.text)) {
+      log.warn(`[router-stream] Claude rate-limited in stream — falling back`);
+      await draft.cancel();
+      const fallbackResult = await fallbackWithoutClaude(chatId, userMessage, userIsAdmin, userId, rateLimitRemainingMinutes());
+      return fallbackResult;
+    }
+
     // Guard against empty responses sneaking through
     if (!streamResult.text || !streamResult.text.trim()) {
       // Auto-recovery: clear session and retry once
@@ -482,6 +586,12 @@ export async function handleMessageStreaming(
       await draft.cancel();
       clearSession(chatId);
       const retryResult = await runClaude(chatId, userMessage, userIsAdmin, model);
+
+      // Check retry for rate limit
+      if (retryResult.type === "message" && retryResult.text && detectAndSetRateLimit(retryResult.text)) {
+        return await fallbackWithoutClaude(chatId, userMessage, userIsAdmin, userId, rateLimitRemainingMinutes());
+      }
+
       const retryText = retryResult.type === "message" && retryResult.text?.trim()
         ? retryResult.text
         : "Désolé, je n'ai pas pu générer de réponse. Réessaie.";
@@ -489,6 +599,8 @@ export async function handleMessageStreaming(
       backgroundExtract(chatId, userMessage, retryText);
       return retryText;
     }
+    // Successful response — clear stale rate limit
+    clearRateLimit();
     addTurn(chatId, { role: "assistant", content: streamResult.text });
     await draft.finalize();
     backgroundExtract(chatId, userMessage, streamResult.text);
@@ -548,13 +660,13 @@ export async function handleMessageStreaming(
     }
 
     // Agent chatId fix: rewrite fake agent chatIds to real admin chatId for telegram.*
-    if (chatId >= 100 && chatId <= 103 && tool.startsWith("telegram.") && config.adminChatId > 0) {
+    if (chatId >= 100 && chatId <= 104 && tool.startsWith("telegram.") && config.adminChatId > 0) {
       safeArgs.chatId = String(config.adminChatId);
       log.debug(`[router-stream] Agent ${chatId}: rewrote chatId to admin ${config.adminChatId} for ${tool}`);
     }
 
     // Hard block: agents (chatId 100-103) cannot use browser.* tools
-    if (chatId >= 100 && chatId <= 103 && tool.startsWith("browser.")) {
+    if (chatId >= 100 && chatId <= 104 && tool.startsWith("browser.")) {
       const msg = `Tool "${tool}" is blocked for agents — use web.search instead.`;
       log.warn(`[router] Agent chatId=${chatId} tried to call ${tool} — blocked`);
       const followUp = `[Tool "${tool}" error]:\n${msg}`;

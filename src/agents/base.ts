@@ -15,56 +15,20 @@ import { clearTurns, clearSession } from "../storage/store.js";
 import { log } from "../utils/log.js";
 import { broadcast } from "../dashboard/broadcast.js";
 import { emitHook } from "../hooks/hooks.js";
+import { isOllamaAvailable, runOllama } from "../llm/ollamaClient.js";
+import { config } from "../config/env.js";
+import {
+  isClaudeRateLimited,
+  getClaudeRateLimitReset,
+  rateLimitRemainingMinutes,
+  detectAndSetRateLimit,
+} from "../llm/rateLimitState.js";
 
 const MAX_CONSECUTIVE_ERRORS = 5;
 
-// --- Global rate limit shared across all agents ---
-let rateLimitUntil = 0; // timestamp (ms) until which all agents should pause
-
-export function isRateLimited(): boolean {
-  return Date.now() < rateLimitUntil;
-}
-
-export function getRateLimitReset(): number {
-  return rateLimitUntil;
-}
-
-function detectRateLimit(text: string): boolean {
-  // Claude CLI returns various rate limit messages:
-  // "You've hit your limit · resets Xam/pm (TZ)"
-  // "Credit balance is too low"
-  if (!/hit your limit|rate.?limit|credit balance is too low/i.test(text)) return false;
-
-  // Try to parse the reset time from the message
-  const match = text.match(/resets?\s+(\d{1,2})(am|pm)\s*\(([^)]+)\)/i);
-  if (match) {
-    const hour = parseInt(match[1]);
-    const isPm = match[2].toLowerCase() === "pm";
-    const tz = match[3];
-    const resetHour = isPm && hour !== 12 ? hour + 12 : !isPm && hour === 12 ? 0 : hour;
-
-    // Calculate next occurrence of that hour in the given timezone
-    const now = new Date();
-    const formatter = new Intl.DateTimeFormat("en-CA", {
-      timeZone: tz,
-      hour: "numeric",
-      hour12: false,
-    });
-    const currentHour = Number(formatter.formatToParts(now).find((p) => p.type === "hour")!.value);
-
-    let hoursUntilReset = resetHour - currentHour;
-    if (hoursUntilReset <= 0) hoursUntilReset += 24;
-
-    rateLimitUntil = Date.now() + hoursUntilReset * 3600_000;
-    log.warn(`[agents] Rate limit detected — pausing all agents for ${hoursUntilReset}h (until ${new Date(rateLimitUntil).toISOString()})`);
-  } else {
-    // Fallback: pause for 2 hours
-    rateLimitUntil = Date.now() + 2 * 3600_000;
-    log.warn(`[agents] Rate limit detected — pausing all agents for 2h (fallback)`);
-  }
-
-  return true;
-}
+// Re-export for backward compatibility
+export const isRateLimited = isClaudeRateLimited;
+export const getRateLimitReset = getClaudeRateLimitReset;
 
 export interface AgentConfig {
   /** Unique agent identifier (e.g. "scout", "concierge") */
@@ -274,10 +238,21 @@ export class Agent {
   private async tick(): Promise<void> {
     if (!this.enabled || this.running) return;
 
-    // Global rate limit: skip all agents until reset
+    // Global rate limit: try Ollama fallback instead of skipping entirely
     if (isRateLimited()) {
-      const remaining = Math.round((rateLimitUntil - Date.now()) / 60_000);
-      log.debug(`[agent:${this.id}] Rate limited — ${remaining}min until reset`);
+      const remaining = rateLimitRemainingMinutes();
+
+      // Check if Ollama is available as backup
+      if (config.ollamaEnabled) {
+        const ollamaUp = await isOllamaAvailable();
+        if (ollamaUp) {
+          log.info(`[agent:${this.id}] Rate limited (${remaining}min) — using Ollama fallback`);
+          await this.tickOllama();
+          return;
+        }
+      }
+
+      log.debug(`[agent:${this.id}] Rate limited — ${remaining}min until reset, no Ollama available`);
       return;
     }
 
@@ -324,7 +299,7 @@ export class Agent {
       const result = await handleMessage(this.chatId, agentPrompt, this.userId, "scheduler");
 
       // Check if Claude returned a rate limit message
-      if (detectRateLimit(result)) {
+      if (detectAndSetRateLimit(result)) {
         const durationMs = Date.now() - startTime;
         this.lastRunAt = Date.now();
         this.lastError = "rate_limit";
@@ -375,6 +350,54 @@ export class Agent {
           // Best effort — don't fail on notification failure
         }
       }
+    } finally {
+      this.running = false;
+    }
+  }
+
+  /** Ollama-only tick — used when Claude is rate-limited but agent still needs to run */
+  private async tickOllama(): Promise<void> {
+    const prompt = this.buildPrompt(this.cycle);
+    this.cycle++;
+
+    if (!prompt) {
+      log.debug(`[agent:${this.id}] Ollama tick cycle ${this.cycle} — skipped (no prompt)`);
+      saveState(this);
+      return;
+    }
+
+    this.running = true;
+    this.status = "running";
+    const startTime = Date.now();
+    log.info(`[agent:${this.id}] Cycle ${this.cycle} — executing via Ollama (rate-limit fallback)`);
+
+    try {
+      const agentPrompt =
+        `[AGENT:${this.id.toUpperCase()}] (${this.name} — ${this.role})\n` +
+        `[MODE: Ollama fallback — pas d'outils disponibles, texte seulement]\n\n` +
+        prompt;
+
+      const result = await runOllama(this.chatId, agentPrompt);
+
+      const durationMs = Date.now() - startTime;
+      this.totalRuns++;
+      this.lastRunAt = Date.now();
+      this.lastError = null;
+      this.consecutiveErrors = 0;
+      this.status = "idle";
+
+      logRun(this.id, this.cycle, startTime, durationMs, "success_ollama");
+      saveState(this);
+      log.info(`[agent:${this.id}] Cycle ${this.cycle} — completed via Ollama (${durationMs}ms)`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      const durationMs = Date.now() - startTime;
+      this.lastError = `ollama_fallback: ${msg}`;
+      this.lastRunAt = Date.now();
+      this.status = "idle"; // Don't increment errors for Ollama failures — it's already a fallback
+      logRun(this.id, this.cycle, startTime, durationMs, "error_ollama", msg);
+      saveState(this);
+      log.warn(`[agent:${this.id}] Ollama fallback failed: ${msg}`);
     } finally {
       this.running = false;
     }
