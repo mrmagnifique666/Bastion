@@ -353,6 +353,7 @@ export async function loadBuiltinSkills(): Promise<void> {
   await import("./builtin/power-tools.js");
   await import("./builtin/soul.js");
   await import("./builtin/mood.js");
+  await import("./builtin/youtube.js");
   await import("./custom/code-request.js");
   await import("./custom/moltbook.js");
   await import("./custom/openweather.js");

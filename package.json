@@ -22,7 +22,8 @@
     "googleapis": "^171.4.0",
     "grammy": "^1.30.0",
     "puppeteer": "^24.37.2",
-    "ws": "^8.19.0"
+    "ws": "^8.19.0",
+    "youtube-transcript": "^1.2.1"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.12",

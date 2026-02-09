@@ -10,6 +10,11 @@ import { getBotPhotoFn } from "./telegram.js";
 
 const MAX_TEXT = 8000;
 
+// ── Semantic Snapshot State ──────────────────────────────────
+// Stores the last snapshot's ref→selector mapping for browser.act
+let lastRefMap: Map<number, string> = new Map();
+let lastSnapshotUrl = "";
+
 // ── Helpers ──────────────────────────────────────────────────
 
 function validateUrl(url: string): string | null {
@@ -794,6 +799,335 @@ registerSkill({
       return `Pressed: ${keys}`;
     } catch (err) {
       return `Error pressing keys: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  },
+});
+
+// ── Phase 4: Semantic Snapshots (OpenClaw-inspired) ─────────
+
+registerSkill({
+  name: "browser.snapshot",
+  description:
+    `Take a semantic snapshot of the current page — returns the accessibility tree with numbered refs instead of a screenshot. Much cheaper than screenshots (~50KB text vs 5MB image), more precise for navigation. Use browser.act to interact with elements by ref number.
+
+Example output:
+  page: https://example.com — "Example Site"
+  [1] heading "Welcome"
+  [2] link "About Us"
+  [3] textbox "Search..." (focused)
+  [4] button "Search"
+  [5] link "Sign In"`,
+  adminOnly: true,
+  argsSchema: {
+    type: "object",
+    properties: {
+      url: { type: "string", description: "Optional URL to navigate to first" },
+      interactive_only: { type: "string", description: "If 'true' (default), only show interactive elements. Set 'false' for full tree." },
+      compact: { type: "string", description: "If 'true' (default), flatten the tree. Set 'false' for indented hierarchy." },
+    },
+  },
+  async execute(args): Promise<string> {
+    const url = args.url as string | undefined;
+    const interactiveOnly = String(args.interactive_only) !== "false";
+    const compact = String(args.compact) !== "false";
+
+    const page = await browserManager.getPage();
+
+    // Navigate if URL provided
+    if (url) {
+      const urlError = validateUrl(url);
+      if (urlError) return `Error: ${urlError}`;
+      try {
+        await page.goto(url, {
+          waitUntil: "domcontentloaded",
+          timeout: config.browserTimeoutMs,
+        });
+      } catch (err) {
+        return `Error navigating to ${url}: ${err instanceof Error ? err.message : String(err)}`;
+      }
+    }
+
+    try {
+      // Inject data-bastion-ref attributes and collect the tree
+      const snapshot = await page.evaluate((interactiveFlag: boolean) => {
+        const INTERACTIVE_ROLES = new Set([
+          "a", "button", "input", "select", "textarea", "details", "summary",
+          "[role=button]", "[role=link]", "[role=tab]", "[role=menuitem]",
+          "[role=checkbox]", "[role=radio]", "[role=switch]", "[role=slider]",
+          "[role=textbox]", "[role=combobox]", "[role=searchbox]",
+          "[role=option]", "[role=listbox]",
+        ]);
+
+        const INTERACTIVE_SELECTOR = [
+          "a[href]", "button", "input:not([type=hidden])", "select", "textarea",
+          "details", "summary",
+          "[role=button]", "[role=link]", "[role=tab]", "[role=menuitem]",
+          "[role=checkbox]", "[role=radio]", "[role=switch]", "[role=slider]",
+          "[role=textbox]", "[role=combobox]", "[role=searchbox]",
+          "[role=option]", "[role=listbox]",
+          "[onclick]", "[tabindex]",
+        ].join(",");
+
+        const LANDMARK_SELECTOR = [
+          "h1", "h2", "h3", "h4", "h5", "h6",
+          "nav", "main", "header", "footer", "aside", "section", "article", "form",
+          "[role=heading]", "[role=navigation]", "[role=main]", "[role=banner]",
+          "[role=contentinfo]", "[role=complementary]", "[role=form]", "[role=search]",
+          "[role=region]", "[role=dialog]", "[role=alert]", "[role=alertdialog]",
+          "img[alt]", "[role=img]",
+        ].join(",");
+
+        function getRole(el: Element): string {
+          const ariaRole = el.getAttribute("role");
+          if (ariaRole) return ariaRole;
+
+          const tag = el.tagName.toLowerCase();
+          const type = (el as HTMLInputElement).type?.toLowerCase();
+          switch (tag) {
+            case "a": return el.hasAttribute("href") ? "link" : "generic";
+            case "button": return "button";
+            case "input":
+              if (type === "submit" || type === "button") return "button";
+              if (type === "checkbox") return "checkbox";
+              if (type === "radio") return "radio";
+              if (type === "search") return "searchbox";
+              return "textbox";
+            case "select": return "combobox";
+            case "textarea": return "textbox";
+            case "img": return "img";
+            case "h1": case "h2": case "h3": case "h4": case "h5": case "h6":
+              return `heading (level ${tag[1]})`;
+            case "nav": return "navigation";
+            case "main": return "main";
+            case "header": return "banner";
+            case "footer": return "contentinfo";
+            case "aside": return "complementary";
+            case "section": return "region";
+            case "article": return "article";
+            case "form": return "form";
+            case "details": return "group";
+            case "summary": return "button";
+            default: return tag;
+          }
+        }
+
+        function getName(el: Element): string {
+          // aria-label takes priority
+          const ariaLabel = el.getAttribute("aria-label");
+          if (ariaLabel) return ariaLabel.trim();
+
+          // aria-labelledby
+          const labelledBy = el.getAttribute("aria-labelledby");
+          if (labelledBy) {
+            const ref = document.getElementById(labelledBy);
+            if (ref) return ref.textContent?.trim() || "";
+          }
+
+          // alt for images
+          if (el.tagName === "IMG") return (el as HTMLImageElement).alt || "";
+
+          // placeholder for inputs
+          const placeholder = (el as HTMLInputElement).placeholder;
+          if (placeholder) return placeholder;
+
+          // title attribute
+          const title = el.getAttribute("title");
+          if (title) return title.trim();
+
+          // innerText (limited)
+          const text = (el as HTMLElement).innerText?.trim() || "";
+          return text.length > 80 ? text.slice(0, 77) + "..." : text;
+        }
+
+        function getState(el: Element): string[] {
+          const states: string[] = [];
+          if (document.activeElement === el) states.push("focused");
+          if ((el as HTMLInputElement).disabled) states.push("disabled");
+          if ((el as HTMLInputElement).checked) states.push("checked");
+          if ((el as HTMLInputElement).readOnly) states.push("readonly");
+          if (el.getAttribute("aria-expanded") === "true") states.push("expanded");
+          if (el.getAttribute("aria-selected") === "true") states.push("selected");
+          if (el.getAttribute("aria-pressed") === "true") states.push("pressed");
+          if ((el as HTMLInputElement).value) {
+            const v = (el as HTMLInputElement).value;
+            if (v.length > 0 && v.length <= 40) states.push(`value="${v}"`);
+            else if (v.length > 40) states.push(`value="${v.slice(0, 37)}..."`);
+          }
+          return states;
+        }
+
+        // Collect elements
+        const selector = interactiveFlag
+          ? INTERACTIVE_SELECTOR + "," + LANDMARK_SELECTOR
+          : "*";
+        const elements = document.querySelectorAll(selector);
+
+        const results: Array<{
+          ref: number;
+          role: string;
+          name: string;
+          states: string[];
+          depth: number;
+          selector: string;
+        }> = [];
+
+        let refCounter = 1;
+
+        elements.forEach((el) => {
+          // Skip invisible elements
+          const style = window.getComputedStyle(el);
+          if (style.display === "none" || style.visibility === "hidden") return;
+          if ((el as HTMLElement).offsetWidth === 0 && (el as HTMLElement).offsetHeight === 0) return;
+
+          const role = getRole(el);
+          if (role === "generic") return; // skip non-semantic
+
+          const name = getName(el);
+          const states = getState(el);
+          const ref = refCounter++;
+
+          // Inject data attribute for later retrieval
+          el.setAttribute("data-bastion-ref", String(ref));
+
+          // Compute depth for hierarchy
+          let depth = 0;
+          let parent = el.parentElement;
+          while (parent) {
+            if (parent.hasAttribute("data-bastion-ref")) depth++;
+            parent = parent.parentElement;
+          }
+
+          // Build a stable selector
+          const stableSelector = `[data-bastion-ref="${ref}"]`;
+
+          results.push({ ref, role, name, states, depth, selector: stableSelector });
+        });
+
+        return results;
+      }, interactiveOnly);
+
+      // Update ref map
+      lastRefMap = new Map();
+      for (const item of snapshot) {
+        lastRefMap.set(item.ref, item.selector);
+      }
+      lastSnapshotUrl = page.url();
+
+      // Format output
+      const title = await page.title();
+      const lines: string[] = [`page: ${page.url()} — "${title}"`, ""];
+
+      for (const item of snapshot) {
+        const indent = compact ? "" : "  ".repeat(item.depth);
+        const stateStr = item.states.length > 0 ? ` (${item.states.join(", ")})` : "";
+        const nameStr = item.name ? ` "${item.name}"` : "";
+        lines.push(`${indent}[${item.ref}] ${item.role}${nameStr}${stateStr}`);
+      }
+
+      lines.push("");
+      lines.push(`${snapshot.length} elements indexed. Use browser.act(ref, action) to interact.`);
+
+      return truncate(lines.join("\n"), MAX_TEXT * 2);
+    } catch (err) {
+      return `Error taking snapshot: ${err instanceof Error ? err.message : String(err)}`;
+    }
+  },
+});
+
+registerSkill({
+  name: "browser.act",
+  description:
+    `Perform an action on a page element identified by its ref number from browser.snapshot.
+Actions: click, type, clear, hover, focus, select.
+Much more reliable than CSS selectors — uses the ref from the last semantic snapshot.
+
+Examples:
+  browser.act(ref=3, action=click)
+  browser.act(ref=5, action=type, text="hello world")
+  browser.act(ref=8, action=select, value="option2")`,
+  adminOnly: true,
+  argsSchema: {
+    type: "object",
+    properties: {
+      ref: { type: "string", description: "Element ref number from browser.snapshot" },
+      action: {
+        type: "string",
+        description: "Action: click, type, clear, hover, focus, select, check, uncheck",
+      },
+      text: { type: "string", description: "Text to type (for action=type)" },
+      value: { type: "string", description: "Value to select (for action=select)" },
+    },
+    required: ["ref", "action"],
+  },
+  async execute(args): Promise<string> {
+    const ref = Number(args.ref);
+    const action = args.action as string;
+    const text = args.text as string | undefined;
+    const value = args.value as string | undefined;
+
+    if (isNaN(ref) || ref < 1) return "Error: ref must be a positive number from browser.snapshot.";
+
+    const selector = lastRefMap.get(ref);
+    if (!selector) {
+      return `Error: ref ${ref} not found. Take a new browser.snapshot first — refs expire when the page changes. Last snapshot was for: ${lastSnapshotUrl || "none"}`;
+    }
+
+    const page = await browserManager.getPage();
+
+    try {
+      const el = await page.$(selector);
+      if (!el) {
+        return `Error: element [ref=${ref}] no longer exists in the DOM. The page may have changed — take a new browser.snapshot.`;
+      }
+
+      switch (action) {
+        case "click":
+          await el.click();
+          return `Clicked [ref=${ref}]. Page: ${page.url()}`;
+
+        case "type":
+          if (!text) return "Error: 'text' is required for action=type.";
+          await el.click();
+          await el.type(text);
+          return `Typed "${text.length > 50 ? text.slice(0, 50) + "..." : text}" into [ref=${ref}].`;
+
+        case "clear":
+          await el.click({ count: 3 }); // select all
+          await page.keyboard.press("Backspace");
+          return `Cleared [ref=${ref}].`;
+
+        case "hover":
+          await el.hover();
+          return `Hovering [ref=${ref}].`;
+
+        case "focus":
+          await el.focus();
+          return `Focused [ref=${ref}].`;
+
+        case "select":
+          if (!value) return "Error: 'value' is required for action=select.";
+          await page.select(selector, value);
+          return `Selected "${value}" in [ref=${ref}].`;
+
+        case "check":
+          await page.evaluate((s: string) => {
+            const el = document.querySelector(s) as HTMLInputElement;
+            if (el && !el.checked) el.click();
+          }, selector);
+          return `Checked [ref=${ref}].`;
+
+        case "uncheck":
+          await page.evaluate((s: string) => {
+            const el = document.querySelector(s) as HTMLInputElement;
+            if (el && el.checked) el.click();
+          }, selector);
+          return `Unchecked [ref=${ref}].`;
+
+        default:
+          return `Error: unknown action "${action}". Use: click, type, clear, hover, focus, select, check, uncheck.`;
+      }
+    } catch (err) {
+      return `Error acting on [ref=${ref}]: ${err instanceof Error ? err.message : String(err)}`;
     }
   },
 });
