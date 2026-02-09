@@ -42,23 +42,24 @@ registerSkill({
     properties: {
       chatId: {
         type: "string",
-        description: "Telegram chat ID to send to (use current chat ID)",
+        description: "Telegram chat ID to send to (optional, defaults to TELEGRAM_ADMIN_CHAT_ID)",
       },
       text: {
         type: "string",
         description: "Message text to send (supports Markdown)",
       },
     },
-    required: ["chatId", "text"],
+    required: ["text"],
   },
   async execute(args): Promise<string> {
     // Accept both chatId and chat_id, both text and message
-    const chatIdStr = (args.chatId ?? args.chat_id) as string;
+    const chatIdStr = (args.chatId ?? args.chat_id) as string | undefined;
     const text = (args.text ?? args.message) as string;
 
-    const chatId = Number(chatIdStr);
+    // Fall back to adminChatId if not provided (for scheduled/autonomous tasks)
+    const chatId = chatIdStr ? Number(chatIdStr) : config.adminChatId;
     if (!chatId || isNaN(chatId)) {
-      return "Error: invalid chat_id — must be a number.";
+      return "Error: invalid chat_id — must be a number. Set TELEGRAM_ADMIN_CHAT_ID in .env for autonomous tasks.";
     }
 
     if (!botSend) {
@@ -88,22 +89,23 @@ registerSkill({
     properties: {
       chatId: {
         type: "string",
-        description: "Telegram chat ID to send to (use current chat ID)",
+        description: "Telegram chat ID to send to (optional, defaults to TELEGRAM_ADMIN_CHAT_ID)",
       },
       text: {
         type: "string",
         description: "Text to convert to speech and send as voice message",
       },
     },
-    required: ["chatId", "text"],
+    required: ["text"],
   },
   async execute(args): Promise<string> {
-    const chatIdStr = (args.chatId ?? args.chat_id) as string;
+    const chatIdStr = (args.chatId ?? args.chat_id) as string | undefined;
     const text = (args.text ?? args.message) as string;
 
-    const chatId = Number(chatIdStr);
+    // Fall back to adminChatId if not provided (for scheduled/autonomous tasks)
+    const chatId = chatIdStr ? Number(chatIdStr) : config.adminChatId;
     if (!chatId || isNaN(chatId)) {
-      return "Error: invalid chat_id — must be a number.";
+      return "Error: invalid chat_id — must be a number. Set TELEGRAM_ADMIN_CHAT_ID in .env for autonomous tasks.";
     }
 
     if (!text || text.trim().length === 0) {
